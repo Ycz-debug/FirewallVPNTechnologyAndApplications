@@ -61,15 +61,19 @@ def reject(reason: str):
 
 # ── 获取变更文件列表 ──────────────────────────────────────
 
+# def get_changed_files():
+#     result = subprocess.run(
+#         ["git", "diff", "--name-only", BASE_SHA, HEAD_SHA],
+#         capture_output=True, text=True
+#     )
+#     files = [f.strip() for f in result.stdout.strip().splitlines() if f.strip()]
+#     return files
+
 def get_changed_files():
-    result = subprocess.run(
-        ["git", "diff", "--name-only", BASE_SHA, HEAD_SHA],
-        capture_output=True, text=True
-    )
-    files = [f.strip() for f in result.stdout.strip().splitlines() if f.strip()]
+    url = f"{GITHUB_API}/repos/{REPO}/pulls/{PR_NUMBER}/files"
+    resp = requests.get(url, headers=HEADERS)
+    files = [f["filename"] for f in resp.json() if f["status"] != "removed"]
     return files
-
-
 # ── 步骤 1：PR 标题格式 ───────────────────────────────────
 # 格式：[学号姓名]LabX作业提交  或  [学号姓名] LabX作业提交
 TITLE_RE = re.compile(r'^\[(\d{10}[\u4e00-\u9fff]+)\]\s?(Lab\d+)作业提交$')

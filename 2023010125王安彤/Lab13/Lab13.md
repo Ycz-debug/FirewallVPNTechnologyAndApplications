@@ -462,7 +462,7 @@ sudo ip netns exec siteA ping -c 3 10.2.0.2
 
 截图：
 
-![alt text](baseline.jpg)
+![alt text](baseline.png)
 
 ---
 
@@ -769,9 +769,8 @@ sudo ip netns exec siteA curl --max-time 3 http://10.2.0.2:8080/
 | `gwA wg0` | 10.1.0.2 ↔ 10.2.0.2 | TCP 8080 | 解密后的跨站点内层包 |
 | `gwB veth-gwb-lan` | 10.1.0.2 ↔ 10.2.0.2 | TCP 8080 | 转发到 B 站点内网的包 |
 
-截图：
-
-![alt text](tcpdump_compare.jpg)
+截图
+![alt text](tcpdump_compare.png)
 
 ---
 

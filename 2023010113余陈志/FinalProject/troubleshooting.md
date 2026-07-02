@@ -2,18 +2,19 @@
 
 ## 场景1：DNAT配置了但外网无法访问
 ### 故障重现
-- **操作**：删除 FORWARD 链中 DNAT 对应的放行规则（行号 22）：
+- **操作**：本次模拟真实生产常见故障：DNAT 端口映射规则正常，但缺少配套转发放行策略。
+手动删除外网访问 DMZ 8080 服务对应的 FORWARD 放行规则，制造阻断故障：
   ```bash
   sudo ip netns exec fw iptables -D FORWARD 22
   ```
-验证故障：
+随后在模拟外网 internet 节点发起访问测试：
 ```bash
 sudo ip netns exec internet curl --max-time 3 http://203.0.113.1:8080/
 ```
-返回 curl: (28) Connection timed out，访问失败。
+访问超时失败，返回错误：curl: (28) Connection timed out，网页提示解析失败、无法访问服务，外网用户无法通过公网地址访问内网 DMZ 业务。
 
 ### 排查过程
-1. `iptables -t nat -L PREROUTING` → 检查 DNAT 规则是否存在：
+1. sudo ip netns exec fw iptables -D FORWARD 22 → 检查 DNAT 规则是否存在：
 ```bash
 sudo ip netns exec fw iptables -t nat -L PREROUTING -n -v | grep 8080
 ```
@@ -27,15 +28,10 @@ sudo ip netns exec fw iptables -L FORWARD -n | grep "10.40.0.2:8080"
 ```bash
 sudo ip netns exec fw conntrack -L -p tcp --dport 8080
 ```
-4. `tcpdump -i veth-fw-inet` → 在 veth-fw-inet 抓包：
-```bash
-sudo ip netns exec fw tcpdump -ni veth-fw-inet -c 5 port 8080
-```
 看到 SYN 包到达，但无转发流量。
 
 ### 根本原因
-DNAT 规则正确将目的地址转换为 10.40.0.2:8080，但 FORWARD 链缺少对应的 ACCEPT 规则，导致 DNAT 后的包被默认 DROP。
-
+PREROUTING 链 DNAT 可正常完成目的 IP 转换，将203.0.113.1:8080转为10.40.0.2:8080；但防火墙 FORWARD 链默认策略为 DROP，缺少外网访问 DMZ 8080 的放行规则，地址转换后的数据包直接被丢弃，无法抵达 DMZ 服务器。
 ### 修复
 添加规则：`iptables -A FORWARD -i veth-fw-inet -o veth-fw-dmz -d 10.40.0.2 -p tcp --dport 8080 -m conntrack --ctstate NEW -j ACCEPT`
 - 验证：`curl` 成功返回页面。
@@ -178,11 +174,9 @@ sudo ip netns exec fw conntrack -L -p tcp --dport 8080
 无连接状态记录，因为缺少状态检测，连接无法建立。
 
 ### 根本原因
-- 三次握手的第一个 SYN 包是 NEW 状态，能够被放行规则匹配并转发。
-
-- 但服务器回应的 SYN-ACK 包既不是 NEW（它不是第一个包），也不是 ESTABLISHED（连接尚未完全建立），需要 RELATED 或 ESTABLISHED 状态检测才能放行。
-
-- 缺少状态检测规则后，SYN-ACK 被默认 DROP，导致连接失败。
+- TCP 三次握手属于双向交互过程，防火墙必须依靠状态检测机制完成完整会话放行。外网访问 DMZ 的首个 SYN 数据包为 NEW 新建状态，可以被手动配置的业务放行规则匹配并正常转发至 DMZ 服务器。
+- 但 DMZ 服务器回复的 SYN-ACK 响应包不属于新建连接报文，不再匹配 NEW 类型放行规则；且此时三次握手尚未完成，会话未进入完全 ESTABLISHED 状态。在缺少全局 ESTABLISHED,RELATED 状态放行规则的情况下，防火墙无法识别该响应包属于合法会话关联流量，最终被 FORWARD 默认 DROP 策略丢弃。
+- 仅单向放行请求流量、阻断回程响应流量，导致 TCP 三次握手无法正常完成，客户端接收不到服务端回应，最终出现连接超时、网页解析失败的故障。这也证明了状态检测规则是 TCP 双向通信的核心前提，仅放行新建流量无法支撑完整网络通信。
 
 ### 用 tcpdump 证明 SYN-ACK 被拦截
 
@@ -199,11 +193,7 @@ sudo ip netns exec fw iptables -I FORWARD 1 -m conntrack --ctstate ESTABLISHED,R
 ```
 验证：curl 成功返回页面。
 ### 必要性说明
-ESTABLISHED,RELATED规则允许已建立连接的回程流量通过，是实现“允许内部主动访问、限制外部主动连接”策略的基础。没有它，TCP 三次握手的后续数据包无法返回，所有需要回包的通信都将中断。同时，它也减少了显式放行规则的数量，简化了防火墙策略管理。
+ESTABLISHED,RELATED 状态放行规则是整个防火墙状态检测机制的核心基础规则，也是 TCP 双向通信能够正常工作的必要前提。TCP 通信基于三次握手实现，新建连接的首个 SYN 数据包属于 NEW 状态，可以依靠手动配置的业务放行规则匹配转发；但服务器返回的 SYN-ACK、ACK 等后续报文不属于新建连接，无法被业务放行规则匹配，同时连接尚未完全建立，也不属于严格意义上的 ESTABLISHED 状态，必须依靠 RELATED/ESTABLISHED 状态机制识别关联会话流量。
+如果缺失该规则，防火墙默认会丢弃所有回应报文，导致三次握手无法完成，最终出现请求能发、回包不通、连接超时的故障。该规则实现了单向主动放行、回程自动放行的安全逻辑，仅允许内网合法主动发起的连接通行，拒绝外部陌生主动连接，完美契合最小权限安全原则。
 
-### 故障场景快速定位方法总结
-| 场景 | 根本原因 | 快速定位方法 |
-|------|----------|--------------|
-| DNAT 不生效 | FORWARD 放行规则缺失 | `查 NAT 表` → `查 FORWARD 表` → `查 conntrack` → `抓包` |
-| VPN 业务不通 | FORWARD 规则缺失 或 AllowedIPs 错误 | `查 wg show` → `查 ip route` → `查 iptables` → `抓包` |
-| TCP 连接失败 | 缺少 ESTABLISHED,RELATED 状态检测 | `抓包对比请求/回包` → `查 conntrack` |
+
